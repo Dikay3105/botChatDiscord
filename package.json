@@ -1,0 +1,20 @@
+{
+  "name": "discord-ai-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.18.0",
+    "axios": "^1.6.8",
+    "discord.js": "^14.19.3",
+    "distube": "^5.0.7",
+    "docx": "^8.0.5",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "pdfkit": "^0.15.2",
+    "ytdl-core": "^4.11.5"
+  }
+}
