@@ -24,7 +24,7 @@ const ytdl = require('@distube/ytdl-core');
 const SpotifyWebApi = require('spotify-web-api-node');
 const stringSimilarity = require('string-similarity');
 const gTTS = require('gtts');
-const RateLimit = require('async-ratelimit');
+const RateLimit = require('async-rate-limit');
 
 // Khởi tạo Spotify API
 const spotifyApi = new SpotifyWebApi({
