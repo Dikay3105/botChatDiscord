@@ -807,19 +807,23 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-try {
-    const privateKey = fs.readFileSync('key.pem', 'utf8');
-    const certificate = fs.readFileSync('cert.pem', 'utf8');
-    const credentials = { key: privateKey, cert: certificate };
+// Route kiểm tra bot hoạt động
+app.get('/', (req, res) => {
+    res.send('Bot is running!');
+});
 
-    app.get('/', (req, res) => {
-        res.send('Bot is running!');
-    });
+// Khởi động HTTP server
+app.listen(PORT, () => {
+    console.log(`🌐 HTTP server đang chạy tại cổng ${PORT}`);
+});
 
-    const httpsServer = https.createServer(credentials, app);
-    httpsServer.listen(PORT, () => {
-        console.log(`✅ HTTPS server đang chạy tại cổng ${PORT}`);
+// Thêm đoạn này vào cuối file sau khi server đã start
+setInterval(() => {
+    const https = require('https');
+
+    https.get('https://botchatdiscord.onrender.com', (res) => {
+        console.log(`[Keep-Alive] Ping thành công với status: ${res.statusCode}`);
+    }).on('error', (e) => {
+        console.error('[Keep-Alive] Lỗi khi ping:', e.message);
     });
-} catch (error) {
-    console.error('❌ Lỗi khởi tạo HTTPS server:', error.message, error.stack);
-}
+}, 1000 * 60 * 4); // Mỗi 4 phút
