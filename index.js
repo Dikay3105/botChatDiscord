@@ -10,7 +10,6 @@ const {
     Routes,
     SlashCommandBuilder,
     PermissionsBitField,
-    DiscordAPIError,
 } = require('discord.js');
 const axios = require('axios');
 const {
@@ -25,7 +24,6 @@ const ytdl = require('@distube/ytdl-core');
 const SpotifyWebApi = require('spotify-web-api-node');
 const stringSimilarity = require('string-similarity');
 const gTTS = require('gtts');
-const RateLimit = require('promise-ratelimit');
 
 // Khởi tạo Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -33,11 +31,6 @@ const spotifyApi = new SpotifyWebApi({
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
     redirectUri: process.env.SPOTIFY_REDIRECT_URI,
 });
-
-// Khởi tạo rate limiter
-const youtubeApiRateLimit = new RateLimit(50); // 20 req/s (50ms delay, optimized)
-const spotifyRateLimit = new RateLimit(100); // 10 req/s (100ms delay, optimized)
-const youtubeStreamRateLimit = new RateLimit(200); // 5 req/s (200ms delay, optimized)
 
 // Slash commands
 const commands = [
@@ -80,6 +73,9 @@ const commands = [
                 .setDescription('Văn bản cần đọc')
                 .setRequired(true)
         ),
+    new SlashCommandBuilder()
+        .setName('destroy')
+        .setDescription('Xóa toàn bộ hàng đợi và ngắt kết nối bot khỏi voice channel'),
 ].map((cmd) => cmd.toJSON());
 
 // Đăng ký slash commands
@@ -103,14 +99,6 @@ const client = new Client({
     ],
 });
 
-// Handle unhandled rejections to prevent crashes
-client.on('error', (error) => {
-    console.error('❌ Client error:', error.message, error.stack);
-});
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
 // Hàng đợi phát nhạc cho mỗi server
 const queues = new Map();
 
@@ -126,44 +114,12 @@ client.once('ready', async () => {
     }
 });
 
-// Hàm xử lý Retry-After cho lỗi 429
-async function handleRateLimit(error, interaction, retryCallback, maxRetries = 3) {
-    if (error.response?.status === 429 || error.status === 429 || error.message.includes('429')) {
-        const retryAfter = parseInt(error.response?.headers['retry-after'] || error.headers?.['retry-after'] || '5', 10) * 1000;
-        console.log(`⚠️ Lỗi 429: Chờ ${retryAfter}ms trước khi thử lại, còn ${maxRetries} lần thử`);
-        if (maxRetries <= 0) {
-            if (interaction) {
-                try {
-                    await interaction.followUp(`❌ Quá nhiều yêu cầu, thử lại sau vài phút.`);
-                } catch (e) {
-                    console.error('❌ Lỗi gửi followUp trong handleRateLimit:', e.message);
-                }
-            }
-            throw new Error('Hết lượt thử lại sau lỗi 429');
-        }
-        if (interaction) {
-            try {
-                await interaction.followUp(`⚠️ Quá nhiều yêu cầu, thử lại sau ${retryAfter / 1000} giây...`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi followUp trong handleRateLimit:', e.message);
-            }
-        }
-        await new Promise((resolve) => setTimeout(resolve, retryAfter));
-        return retryCallback(maxRetries - 1);
-    }
-    throw error;
-}
-
 // Hàm tính độ tương đồng chuỗi
 function getBestMatch(query, results) {
     let bestMatch = null;
     let highestSimilarity = 0;
 
     results.forEach((result) => {
-        if (!result || !result.title || typeof result.title !== 'string') {
-            console.log('⚠️ Kết quả không hợp lệ trong getBestMatch:', result);
-            return;
-        }
         const similarity = stringSimilarity.compareTwoStrings(query.toLowerCase(), result.title.toLowerCase());
         if (similarity > highestSimilarity) {
             highestSimilarity = similarity;
@@ -192,59 +148,56 @@ function extractMediaId(url) {
 
 // Hàm tìm video YouTube
 async function findYouTubeVideo(title) {
-    return youtubeApiRateLimit(async () => {
-        try {
-            const ytSearchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(title + ' official audio')}&type=video&key=${process.env.YOUTUBE_API_KEY}&maxResults=3`;
-            const ytResponse = await axios.get(ytSearchUrl);
-            const ytResults = ytResponse.data.items;
-            if (!ytResults || ytResults.length === 0) {
-                console.log('⚠️ Không tìm thấy video YouTube cho:', title);
-                return null;
-            }
-            const bestVideo = ytResults.reduce((best, current) => {
-                const bestViews = best.snippet?.viewCount || 0;
-                const currentViews = current.snippet?.viewCount || 0;
-                return currentViews > bestViews ? current : best;
-            });
-            return {
-                url: `https://www.youtube.com/watch?v=${bestVideo.id.videoId}`,
-                title: bestVideo.snippet.title,
-            };
-        } catch (error) {
-            console.error('❌ Lỗi tìm kiếm YouTube:', error.message);
-            return await handleRateLimit(error, null, () => findYouTubeVideo(title));
+    try {
+        const ytSearchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(title + ' official audio')}&type=video&key=${process.env.YOUTUBE_API_KEY}&maxResults=5`;
+        const ytResponse = await axios.get(ytSearchUrl);
+        const ytResults = ytResponse.data.items;
+        if (!ytResults || ytResults.length === 0) {
+            console.log('⚠️ Không tìm thấy video YouTube cho:', title);
+            return null;
         }
-    });
+        // Chọn video có lượt xem cao nhất
+        const bestVideo = ytResults.reduce((best, current) => {
+            const bestViews = best.snippet?.viewCount || 0;
+            const currentViews = current.snippet?.viewCount || 0;
+            return currentViews > bestViews ? current : best;
+        });
+        return {
+            url: `https://www.youtube.com/watch?v=${bestVideo.id.videoId}`,
+            title: bestVideo.snippet.title,
+        };
+    } catch (error) {
+        console.error('❌ Lỗi tìm kiếm YouTube:', error.message);
+        return null;
+    }
 }
 
 // Hàm lấy danh sách video từ YouTube playlist
 async function fetchYouTubePlaylist(playlistId) {
-    return youtubeApiRateLimit(async () => {
-        try {
-            const ytPlaylistUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=10&playlistId=${playlistId}&key=${process.env.YOUTUBE_API_KEY}`;
-            const response = await axios.get(ytPlaylistUrl);
-            const items = response.data.items;
-            if (!items || items.length === 0) {
-                console.log('⚠️ Playlist YouTube trống:', playlistId);
-                return [];
-            }
-            return items.map((item) => ({
-                url: `https://www.youtube.com/watch?v=${item.snippet.resourceId.videoId}`,
-                title: item.snippet.title,
-                source: 'youtube',
-            }));
-        } catch (error) {
-            console.error('❌ Lỗi lấy playlist YouTube:', error.message);
-            return await handleRateLimit(error, null, () => fetchYouTubePlaylist(playlistId));
+    try {
+        const ytPlaylistUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=50&playlistId=${playlistId}&key=${process.env.YOUTUBE_API_KEY}`;
+        const response = await axios.get(ytPlaylistUrl);
+        const items = response.data.items;
+        if (!items || items.length === 0) {
+            console.log('⚠️ Playlist YouTube trống:', playlistId);
+            return [];
         }
-    });
+        return items.map((item) => ({
+            url: `https://www.youtube.com/watch?v=${item.snippet.resourceId.videoId}`,
+            title: item.snippet.title,
+            source: 'youtube',
+        }));
+    } catch (error) {
+        console.error('❌ Lỗi lấy playlist YouTube:', error.message);
+        return [];
+    }
 }
 
 // Hàm tạo file TTS
 async function createTTSFile(text, guildId) {
     return new Promise((resolve, reject) => {
         const filePath = path.join(__dirname, `tts_${guildId}_${Date.now()}.mp3`);
-        const tts = new gTTS(text, 'vi');
+        const tts = new gTTS(text, 'vi'); // Ngôn ngữ tiếng Việt
         tts.save(filePath, (err) => {
             if (err) {
                 console.error('❌ Lỗi tạo file TTS:', err.message);
@@ -275,17 +228,37 @@ function scheduleLeave(guildId, interaction) {
             console.log('🏃 Bot rời kênh voice sau 3 phút, guild:', guildId);
             queue.connection.destroy();
             queues.delete(guildId);
+            interaction.followUp('🎶 Hàng đợi trống, bot đã rời kênh voice sau 3 phút.');
+        }
+    }, 180000); // 3 phút
+}
+
+// Hàm xóa toàn bộ queue
+function clearQueue(guildId) {
+    const queue = queues.get(guildId);
+    if (!queue) return;
+
+    // Xóa các file TTS nếu có
+    queue.songs.forEach((song) => {
+        if (song.source === 'tts' && song.url) {
             try {
-                interaction.followUp('🎶 Hàng đợi trống, bot đã rời kênh voice sau 3 phút.');
+                fs.unlinkSync(song.url);
+                console.log('🗑 Đã xóa file TTS:', song.url);
             } catch (e) {
-                console.error('❌ Lỗi gửi followUp trong scheduleLeave:', e.message);
+                console.error('❌ Lỗi xóa file TTS:', e.message);
             }
         }
-    }, 180000);
+    });
+
+    // Xóa queue và dừng player
+    queue.songs = [];
+    queue.player.stop();
+    console.log('🗑 Đã xóa toàn bộ queue:', guildId);
 }
 
 // Hàm phát bài hát hoặc TTS
-async function playSong(interaction, queue, retries = 3) {
+async function playSong(interaction, queue) {
+    // Hủy timeout rời kênh nếu có bài mới {
     if (queue.leaveTimeout) {
         console.log('🔄 Hủy timeout rời kênh vì có bài mới:', interaction.guild.id);
         clearTimeout(queue.leaveTimeout);
@@ -294,7 +267,7 @@ async function playSong(interaction, queue, retries = 3) {
 
     if (!queue.songs.length) {
         console.log('📭 Queue rỗng, lên lịch rời kênh:', interaction.guild.id);
-        queue.player.stop();
+        queue.player.stop(); // Dừng player để tránh phát lại
         scheduleLeave(interaction.guild.id, interaction);
         return;
     }
@@ -307,48 +280,26 @@ async function playSong(interaction, queue, retries = 3) {
                 inputType: StreamType.Raw,
             });
         } else {
-            await youtubeStreamRateLimit(async () => {
-                console.log(`🔍 Bắt đầu stream YouTube: ${song.url}`);
-                const stream = ytdl(song.url, {
-                    filter: 'audioonly',
-                    quality: 'highestaudio',
-                    highWaterMark: 1 << 25,
-                });
-                resource = createAudioResource(stream, {
-                    inputType: StreamType.WebmOpus,
-                });
+            const stream = ytdl(song.url, {
+                filter: 'audioonly',
+                quality: 'highestaudio',
+                highWaterMark: 1 << 25,
+            });
+            console.log('🔍 Stream obtained from @distube/ytdl-core:', song.url);
+            resource = createAudioResource(stream, {
+                inputType: StreamType.WebmOpus,
             });
         }
 
         queue.player.play(resource);
         queue.connection.subscribe(queue.player);
-        console.log(`🎶 Đang phát: ${song.title} (Nguồn: ${song.source})`);
-        try {
-            await interaction.followUp(`🎶 Đang phát: **${song.title}** (Nguồn: ${song.source})`);
-        } catch (e) {
-            console.error('❌ Lỗi gửi followUp trong playSong:', e.message);
-        }
+        console.log(`🎶 Đang phát: ${song.title} (Nguồn:Tesla: ${song.source})`);
+        await interaction.followUp(`🎶 Đang phát: **${song.title}** (Nguồn: ${song.source})`);
     } catch (error) {
-        console.error('❌ Lỗi AudioPlayer:', error.message, error.stack);
-        if ((error.status === 429 || error.message.includes('429')) && retries > 0) {
-            const retryAfter = parseInt(error.response?.headers?.['retry-after'] || '5', 10) * 1000;
-            console.log(`⚠️ Lỗi 429 khi stream, chờ ${retryAfter}ms, còn ${retries} lần thử lại`);
-            try {
-                await interaction.followUp(`⚠️ Quá nhiều yêu cầu YouTube, thử lại sau ${retryAfter / 1000} giây...`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi followUp trong playSong 429:', e.message);
-            }
-            await new Promise((resolve) => setTimeout(resolve, retryAfter));
-            return playSong(interaction, queue, retries - 1);
-        }
+        console.error('❌ Lỗi khi phát:', error.message);
         if (song.source === 'tts' && song.url) {
-            try { fs.unlinkSync(song.url); } catch (e) {}
+            try { fs.unlinkSync(song.url); } catch (e) { }
             console.log('🗑 Đã xóa file TTS do lỗi:', song.url);
-        }
-        try {
-            await interaction.followUp(`❌ Lỗi khi phát **${song.title}**: ${error.message}`);
-        } catch (e) {
-            console.error('❌ Lỗi gửi followUp trong playSong error:', e.message);
         }
         queue.songs.shift();
         playSong(interaction, queue);
@@ -363,9 +314,9 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName } = interaction;
 
     if (commandName === 'ai') {
+        const prompt = interaction.options.getString('prompt');
+        await interaction.deferReply();
         try {
-            await interaction.deferReply();
-            const prompt = interaction.options.getString('prompt');
             const response = await axios.post(
                 'https://openrouter.ai/api/v1/chat/completions',
                 {
@@ -381,7 +332,7 @@ client.on('interactionCreate', async (interaction) => {
             );
 
             const reply = response.data.choices[0].message.content;
-            const file = await generateFileFromResponse(prompt, reply);
+            const file = await generateFileFromResponse(prompt, reply)
 
             if (file) {
                 await interaction.editReply({
@@ -397,48 +348,39 @@ client.on('interactionCreate', async (interaction) => {
             }
         } catch (error) {
             console.error('❌ Lỗi AI:', error.message);
-            try {
-                await interaction.editReply('❌ Có lỗi xảy ra khi gọi OpenRouter.');
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong AI:', e.message);
-            }
+            await interaction.editReply('❌ Có lỗi xảy ra khi gọi OpenRouter.');
         }
     } else if (commandName === 'play') {
+        const query = interaction.options.getString('query');
+        const member = interaction.member;
+        const voiceChannel = member?.voice?.channel;
+        const guild = interaction.guild;
+
+        // Kiểm tra điều kiện cần thiết
+        if (!guild) {
+            console.log('⚠️ Lệnh play trong non-guild context');
+            return interaction.reply('❌ Lệnh này chỉ hoạt động trong server.');
+        }
+        if (!voiceChannel) {
+            console.log('⚠️ User không ở voice channel');
+            return interaction.reply('❌ Bạn cần tham gia voice channel trước!');
+        }
+        if (
+            !voiceChannel.permissionsFor(guild.members.me).has([
+                PermissionsBitField.Flags.Connect,
+                PermissionsBitField.Flags.Speak,
+            ])
+        ) {
+            console.log('⚠️ Bot thiếu quyền Connect/Speak');
+            return interaction.reply(
+                '❌ Bot không có quyền tham gia hoặc phát âm thanh trong voice channel!'
+            );
+        }
+
+        await interaction.deferReply();
+
         try {
-            // Defer reply immediately to avoid 3-second timeout
-            await interaction.deferReply().catch((e) => {
-                if (e instanceof DiscordAPIError && e.code === 10062) {
-                    console.error('⚠️ Unknown interaction during deferReply:', e.message);
-                } else {
-                    console.error('❌ Lỗi deferReply:', e.message);
-                }
-            });
-
-            const query = interaction.options.getString('query');
-            const member = interaction.member;
-            const voiceChannel = member?.voice?.channel;
-            const guild = interaction.guild;
-
-            if (!guild) {
-                console.log('⚠️ Lệnh play trong non-guild context');
-                return interaction.editReply('❌ Lệnh này chỉ hoạt động trong server.');
-            }
-            if (!voiceChannel) {
-                console.log('⚠️ User không ở voice channel');
-                return interaction.editReply('❌ Bạn cần tham gia voice channel trước!');
-            }
-            if (
-                !voiceChannel.permissionsFor(guild.members.me).has([
-                    PermissionsBitField.Flags.Connect,
-                    PermissionsBitField.Flags.Speak,
-                ])
-            ) {
-                console.log('⚠️ Bot thiếu quyền Connect/Speak');
-                return interaction.editReply(
-                    '❌ Bot không có quyền tham gia hoặc phát âm thanh trong voice channel!'
-                );
-            }
-
+            // Khởi tạo queue nếu chưa có
             let queue = queues.get(guild.id);
             if (!queue) {
                 console.log('🆕 Tạo queue mới cho guild:', guild.id);
@@ -452,6 +394,7 @@ client.on('interactionCreate', async (interaction) => {
                 queues.set(guild.id, queue);
             }
 
+            // Kết nối voice channel nếu cần
             if (
                 !queue.connection ||
                 queue.connection.state.status === VoiceConnectionStatus.Disconnected ||
@@ -460,7 +403,7 @@ client.on('interactionCreate', async (interaction) => {
                 console.log('🔌 Tạo hoặc tái tạo kết nối voice:', voiceChannel.id, ', trạng thái trước:', queue.connection?.state?.status || 'null');
                 if (queue.connection) {
                     queue.connection.destroy();
-                    console.log('🗑 Đã hủy kết nối voice cũ:', guild.id);
+                    console.log('🗑️ Đã hủy kết nối voice cũ:', guild.id);
                 }
                 queue.connection = joinVoiceChannel({
                     channelId: voiceChannel.id,
@@ -470,18 +413,18 @@ client.on('interactionCreate', async (interaction) => {
 
                 queue.connection.on(VoiceConnectionStatus.Disconnected, async () => {
                     console.log('🔴 Bot bị ngắt kết nối khỏi voice channel:', guild.id);
+                    clearQueue(guild.id); // Xóa toàn bộ queue khi bị disconnect
                     queue.connection?.destroy();
                     queue.connection = null;
-                    if (queue.songs.length === 0 && !queue.leaveTimeout) {
-                        scheduleLeave(guild.id, interaction);
-                    }
+                    queues.delete(guild.id);
+                    await interaction.followUp('🎶 Bot đã bị ngắt kết nối, hàng đợi đã được xóa.');
                 });
 
                 queue.player.on(AudioPlayerStatus.Idle, () => {
                     console.log('⏹ Player idle, chuyển bài tiếp theo:', guild.id);
                     const currentSong = queue.songs[0];
                     if (currentSong && currentSong.source === 'tts' && currentSong.url) {
-                        try { fs.unlinkSync(currentSong.url); } catch (e) {}
+                        try { fs.unlinkSync(currentSong.url); } catch (e) { }
                         console.log('🗑 Đã xóa file TTS:', currentSong.url);
                     }
                     queue.songs.shift();
@@ -489,117 +432,65 @@ client.on('interactionCreate', async (interaction) => {
                 });
 
                 queue.player.on('error', (error) => {
-                    console.error('❌ Lỗi AudioPlayer:', error.message, error.stack);
+                    console.error('❌ Lỗi AudioPlayer:', error.message);
                     const currentSong = queue.songs[0];
                     if (currentSong && currentSong.source === 'tts' && currentSong.url) {
-                        try { fs.unlinkSync(currentSong.url); } catch (e) {}
+                        try { fs.unlinkSync(currentSong.url); } catch (e) { }
                         console.log('🗑 Đã xóa file TTS do lỗi:', currentSong.url);
                     }
-                    try {
-                        interaction.followUp('❌ Có lỗi khi phát.');
-                    } catch (e) {
-                        console.error('❌ Lỗi gửi followUp trong player error:', e.message);
-                    }
+                    interaction.followUp('❌ Có lỗi khi phát.');
                     queue.songs.shift();
                     playSong(interaction, queue);
                 });
             }
 
+            // Xử lý query
             const mediaId = extractMediaId(query);
             if (mediaId) {
                 console.log('🔍 Xử lý media:', mediaId);
                 if (mediaId.type === 'spotify_track') {
-                    await spotifyRateLimit(async () => {
-                        try {
-                            const trackResponse = await spotifyApi.getTrack(mediaId.id);
-                            const track = trackResponse.body;
-                            if (!track) {
-                                console.log('⚠️ Không tìm thấy track Spotify:', mediaId.id);
-                                return interaction.editReply('❌ Không tìm thấy bài hát từ link Spotify.');
-                            }
-                            const title = `${track.name} - ${track.artists[0].name}`;
-                            const ytVideo = await findYouTubeVideo(title);
-                            if (!ytVideo) {
-                                console.log('⚠️ Không tìm thấy video YouTube cho track:', title);
-                                return interaction.editReply('❌ Không tìm thấy video YouTube tương ứng.');
-                            }
+                    // Xử lý track Spotify
+                    const trackResponse = await spotifyApi.getTrack(mediaId.id);
+                    const track = trackResponse.body;
+                    if (!track) {
+                        console.log('⚠️ Không tìm thấy track Spotify:', mediaId.id);
+                        return interaction.editReply('❌ Không tìm thấy bài hát từ link Spotify.');
+                    }
+                    const title = `${track.name} - ${track.artists[0].name}`;
+                    const ytVideo = await findYouTubeVideo(title);
+                    if (!ytVideo) {
+                        console.log('⚠️ Không tìm thấy video YouTube cho track:', title);
+                        return interaction.editReply('❌ Không tìm thấy video YouTube tương ứng.');
+                    }
+                    queue.songs.push({
+                        url: ytVideo.url,
+                        title: ytVideo.title,
+                        source: 'spotify',
+                    });
+                    console.log('🎵 Spotify Track:', JSON.stringify(queue.songs[queue.songs.length - 1], null, 2));
+                } else if (mediaId.type === 'spotify_playlist') {
+                    // Xử lý playlist Spotify
+                    const playlistResponse = await spotifyApi.getPlaylist(mediaId.id);
+                    const playlist = playlistResponse.body;
+                    if (!playlist || !playlist.tracks.items) {
+                        console.log('⚠️ Không tìm thấy playlist Spotify:', mediaId.id);
+                        return interaction.editReply('❌ Không tìm thấy playlist từ link Spotify.');
+                    }
+                    for (const item of playlist.tracks.items) {
+                        const track = item.track;
+                        const title = `${track.name} - ${track.artists[0].name}`;
+                        const ytVideo = await findYouTubeVideo(title);
+                        if (ytVideo) {
                             queue.songs.push({
                                 url: ytVideo.url,
                                 title: ytVideo.title,
                                 source: 'spotify',
                             });
-                            console.log('🎵 Spotify Track:', JSON.stringify(queue.songs[queue.songs.length - 1], null, 2));
-                        } catch (error) {
-                            await handleRateLimit(error, interaction, async (retries) => {
-                                const trackResponse = await spotifyApi.getTrack(mediaId.id);
-                                const track = trackResponse.body;
-                                const title = `${track.name} - ${track.artists[0].name}`;
-                                const ytVideo = await findYouTubeVideo(title);
-                                if (!ytVideo) throw new Error('No YouTube video found');
-                                queue.songs.push({
-                                    url: ytVideo.url,
-                                    title: ytVideo.title,
-                                    source: 'spotify',
-                                });
-                            }).catch((err) => {
-                                try {
-                                    interaction.editReply(`❌ Lỗi Spotify: ${err.message}`);
-                                } catch (e) {
-                                    console.error('❌ Lỗi gửi editReply trong Spotify track:', e.message);
-                                }
-                            });
+                            console.log('🎵 Spotify Playlist Track:', JSON.stringify(queue.songs[queue.songs.length - 1], null, 2));
                         }
-                    });
-                } else if (mediaId.type === 'spotify_playlist') {
-                    await spotifyRateLimit(async () => {
-                        try {
-                            const playlistResponse = await spotifyApi.getPlaylist(mediaId.id);
-                            const playlist = playlistResponse.body;
-                            if (!playlist || !playlist.tracks.items) {
-                                console.log('⚠️ Không tìm thấy playlist Spotify:', mediaId.id);
-                                return interaction.editReply('❌ Không tìm thấy playlist từ link Spotify.');
-                            }
-                            const tracks = playlist.tracks.items.slice(0, 10);
-                            for (const item of tracks) {
-                                const track = item.track;
-                                const title = `${track.name} - ${track.artists[0].name}`;
-                                const ytVideo = await findYouTubeVideo(title);
-                                if (ytVideo) {
-                                    queue.songs.push({
-                                        url: ytVideo.url,
-                                        title: ytVideo.title,
-                                        source: 'spotify',
-                                    });
-                                    console.log('🎵 Spotify Playlist Track:', JSON.stringify(queue.songs[queue.songs.length - 1], null, 2));
-                                }
-                            }
-                        } catch (error) {
-                            await handleRateLimit(error, interaction, async (retries) => {
-                                const playlistResponse = await spotifyApi.getPlaylist(mediaId.id);
-                                const playlist = playlistResponse.body;
-                                const tracks = playlist.tracks.items.slice(0, 10);
-                                for (const item of tracks) {
-                                    const track = item.track;
-                                    const title = `${track.name} - ${track.artists[0].name}`;
-                                    const ytVideo = await findYouTubeVideo(title);
-                                    if (ytVideo) {
-                                        queue.songs.push({
-                                            url: ytVideo.url,
-                                            title: ytVideo.title,
-                                            source: 'spotify',
-                                        });
-                                    }
-                                }
-                            }).catch((err) => {
-                                try {
-                                    interaction.editReply(`❌ Lỗi Spotify playlist: ${err.message}`);
-                                } catch (e) {
-                                    console.error('❌ Lỗi gửi editReply trong Spotify playlist:', e.message);
-                                }
-                            });
-                        }
-                    });
+                    }
                 } else if (mediaId.type === 'youtube_playlist') {
+                    // Xử lý playlist YouTube
                     const videos = await fetchYouTubePlaylist(mediaId.id);
                     if (videos.length === 0) {
                         console.log('⚠️ Không tìm thấy video trong playlist YouTube:', mediaId.id);
@@ -610,78 +501,71 @@ client.on('interactionCreate', async (interaction) => {
                 }
             } else {
                 console.log('🔍 Tìm kiếm query:', query);
+                // Tìm kiếm trên Spotify và YouTube
                 const [spotifyResult, youtubeResult] = await Promise.allSettled([
-                    spotifyRateLimit(async () => {
-                        try {
-                            const searchResults = await spotifyApi.searchTracks(query, { limit: 1 });
-                            const tracks = searchResults.body.tracks.items;
-                            if (!tracks || tracks.length === 0) {
-                                throw new Error('No Spotify results');
-                            }
-                            const track = tracks[0];
-                            const title = `${track.name} - ${track.artists[0].name}`;
-                            const ytVideo = await findYouTubeVideo(title);
+                    // Spotify search
+                    (async () => {
+                        const searchResults = await spotifyApi.searchTracks(query, { limit: 1 });
+                        const tracks = searchResults.body.tracks.items;
+                        if (!tracks || tracks.length === 0) {
+                            throw new Error('No Spotify results');
+                        }
+                        const track = tracks[0];
+                        const title = `${track.name} - ${track.artists[0].name}`;
+                        const ytVideo = await findYouTubeVideo(title);
+                        if (!ytVideo) {
+                            throw new Error('No YouTube match for Spotify track');
+                        }
+                        return {
+                            source: 'spotify',
+                            title: ytVideo.title,
+                            url: ytVideo.url,
+                        };
+                    })(),
+                    // YouTube search
+                    (async () => {
+                        if (ytdl.validateURL(query)) {
+                            const videoDetails = await ytdl.getBasicInfo(query);
+                            return {
+                                source: 'youtube',
+                                title: videoDetails.videoDetails.title,
+                                url: videoDetails.videoDetails.video_url,
+                            };
+                        } else {
+                            const ytVideo = await findYouTubeVideo(query);
                             if (!ytVideo) {
-                                throw new Error('No YouTube match for Spotify track');
+                                throw new Error('No YouTube results');
                             }
                             return {
-                                source: 'spotify',
+                                source: 'youtube',
                                 title: ytVideo.title,
                                 url: ytVideo.url,
                             };
-                        } catch (error) {
-                            console.error('❌ Lỗi tìm kiếm Spotify:', error.message);
-                            return null;
                         }
-                    }),
-                    youtubeApiRateLimit(async () => {
-                        try {
-                            if (ytdl.validateURL(query)) {
-                                const videoDetails = await ytdl.getBasicInfo(query);
-                                return {
-                                    source: 'youtube',
-                                    title: videoDetails.videoDetails.title,
-                                    url: videoDetails.videoDetails.video_url,
-                                };
-                            } else {
-                                const ytVideo = await findYouTubeVideo(query);
-                                if (!ytVideo) {
-                                    throw new Error('No YouTube results');
-                                }
-                                return {
-                                    source: 'youtube',
-                                    title: ytVideo.title,
-                                    url: ytVideo.url,
-                                };
-                            }
-                        } catch (error) {
-                            console.error('❌ Lỗi tìm kiếm YouTube:', error.message);
-                            return null;
-                        }
-                    }),
+                    })(),
                 ]);
 
+                // Thu thập kết quả hợp lệ
                 const validResults = [];
-                if (spotifyResult.status === 'fulfilled' && spotifyResult.value) {
+                if (spotifyResult.status === 'fulfilled') {
                     validResults.push(spotifyResult.value);
                     console.log('🔍 Spotify Result:', JSON.stringify(spotifyResult.value, null, 2));
                 } else {
-                    console.log('⚠️ Spotify Error:', spotifyResult.reason?.message || 'No Spotify result');
+                    console.log('⚠️ Spotify Error:', spotifyResult.reason.message);
                 }
-                if (youtubeResult.status === 'fulfilled' && youtubeResult.value) {
+                if (youtubeResult.status === 'fulfilled') {
                     validResults.push(youtubeResult.value);
                     console.log('🔍 YouTube Result:', JSON.stringify(youtubeResult.value, null, 2));
                 } else {
-                    console.log('⚠️ YouTube Error:', youtubeResult.reason?.message || 'No YouTube result');
+                    console.log('⚠️ YouTube Error:', youtubeResult.reason.message);
                 }
-
-                console.log('🔍 Valid Results:', JSON.stringify(validResults, null, 2));
 
                 if (validResults.length === 0) {
                     console.log('⚠️ Không tìm thấy bài hát nào');
                     return interaction.editReply('❌ Không tìm thấy bài hát nào trên Spotify hoặc YouTube.');
                 }
 
+                // Chọn kết quả tốt nhất
                 const bestMatch = getBestMatch(query, validResults);
                 if (!bestMatch) {
                     console.log('⚠️ Không tìm thấy bài hát phù hợp');
@@ -695,6 +579,7 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
+            // Phát bài hát
             if (queue.songs.length === 1) {
                 console.log('🎵 Phát bài đầu tiên:', queue.songs[0].title);
                 await interaction.editReply(`🎶 Đã thêm: **${queue.songs[0].title}** (Nguồn: ${queue.songs[0].source})`);
@@ -705,45 +590,46 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.editReply(`🎶 Đã thêm ${addedCount} bài vào hàng đợi. Bài đầu tiên: **${queue.songs[0].title}** (Nguồn: ${queue.songs[0].source})`);
             }
         } catch (err) {
-            console.error('❌ Lỗi khi phát âm nhạc:', err.message, err.stack);
-            try {
-                await interaction.editReply(`❌ Không thể phát nhạc: ${err.message || 'Lỗi không xác định.'}`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong play:', e.message);
-            }
+            console.error('❌ Lỗi khi phát nhạc:', err.message);
+            await interaction.editReply(
+                `❌ Không thể phát nhạc: ${err.message || 'Lỗi không xác định.'}`
+            );
         }
     } else if (commandName === 'tts') {
+        const text = interaction.options.getString('text');
+        const member = interaction.member;
+        const voiceChannel = member?.voice?.channel;
+        const guild = interaction.guild;
+
+        // Kiểm tra điều kiện cần thiết
+        if (!guild) {
+            console.log('⚠️ Lệnh tts trong non-guild context');
+            return interaction.reply('❌ Lệnh này chỉ hoạt động trong server.');
+        }
+        if (!voiceChannel) {
+            console.log('⚠️ User không ở voice channel');
+            return interaction.reply('❌ Bạn cần tham gia voice channel trước!');
+        }
+        if (
+            !voiceChannel.permissionsFor(guild.members.me).has([
+                PermissionsBitField.Flags.Connect,
+                PermissionsBitField.Flags.Speak,
+            ])
+        ) {
+            console.log('⚠️ Bot thiếu quyền Connect/Speak');
+            return interaction.reply(
+                '❌ Bot không có quyền tham gia hoặc phát âm thanh trong voice channel!'
+            );
+        }
+        if (text.length > 5000) {
+            console.log('⚠️ Text TTS quá dài:', text.length);
+            return interaction.reply('❌ Văn bản quá dài (tối đa 5000 ký tự).');
+        }
+
+        await interaction.deferReply();
+
         try {
-            await interaction.deferReply();
-            const text = interaction.options.getString('text');
-            const member = interaction.member;
-            const voiceChannel = member?.voice?.channel;
-            const guild = interaction.guild;
-
-            if (!guild) {
-                console.log('⚠️ Lệnh tts trong non-guild context');
-                return interaction.editReply('❌ Lệnh này chỉ hoạt động trong server.');
-            }
-            if (!voiceChannel) {
-                console.log('⚠️ User không ở voice channel');
-                return interaction.editReply('❌ Bạn cần tham gia voice channel trước!');
-            }
-            if (
-                !voiceChannel.permissionsFor(guild.members.me).has([
-                    PermissionsBitField.Flags.Connect,
-                    PermissionsBitField.Flags.Speak,
-                ])
-            ) {
-                console.log('⚠️ Bot thiếu quyền Connect/Speak');
-                return interaction.editReply(
-                    '❌ Bot không có quyền tham gia hoặc phát âm thanh trong voice channel!'
-                );
-            }
-            if (text.length > 5000) {
-                console.log('⚠️ Text TTS quá dài:', text.length);
-                return interaction.editReply('❌ Văn bản quá dài (tối đa 5000 ký tự).');
-            }
-
+            // Khởi tạo queue nếu chưa có
             let queue = queues.get(guild.id);
             if (!queue) {
                 console.log('🆕 Tạo queue mới cho guild:', guild.id);
@@ -757,6 +643,7 @@ client.on('interactionCreate', async (interaction) => {
                 queues.set(guild.id, queue);
             }
 
+            // Kết nối voice channel nếu cần
             if (
                 !queue.connection ||
                 queue.connection.state.status === VoiceConnectionStatus.Disconnected ||
@@ -775,18 +662,18 @@ client.on('interactionCreate', async (interaction) => {
 
                 queue.connection.on(VoiceConnectionStatus.Disconnected, async () => {
                     console.log('🔴 Bot bị ngắt kết nối khỏi voice channel:', guild.id);
+                    clearQueue(guild.id); // Xóa toàn bộ queue khi bị disconnect
                     queue.connection?.destroy();
                     queue.connection = null;
-                    if (queue.songs.length === 0 && !queue.leaveTimeout) {
-                        scheduleLeave(guild.id, interaction);
-                    }
+                    queues.delete(guild.id);
+                    await interaction.followUp('🎶 Bot đã bị ngắt kết nối, hàng đợi đã được xóa.');
                 });
 
                 queue.player.on(AudioPlayerStatus.Idle, () => {
                     console.log('⏹ Player idle, chuyển bài tiếp theo:', guild.id);
                     const currentSong = queue.songs[0];
                     if (currentSong && currentSong.source === 'tts' && currentSong.url) {
-                        try { fs.unlinkSync(currentSong.url); } catch (e) {}
+                        try { fs.unlinkSync(currentSong.url); } catch (e) { }
                         console.log('🗑 Đã xóa file TTS:', currentSong.url);
                     }
                     queue.songs.shift();
@@ -794,22 +681,19 @@ client.on('interactionCreate', async (interaction) => {
                 });
 
                 queue.player.on('error', (error) => {
-                    console.error('❌ Lỗi AudioPlayer:', error.message, error.stack);
+                    console.error('❌ Lỗi AudioPlayer:', error.message);
                     const currentSong = queue.songs[0];
                     if (currentSong && currentSong.source === 'tts' && currentSong.url) {
-                        try { fs.unlinkSync(currentSong.url); } catch (e) {}
+                        try { fs.unlinkSync(currentSong.url); } catch (e) { }
                         console.log('🗑 Đã xóa file TTS do lỗi:', currentSong.url);
                     }
-                    try {
-                        interaction.followUp('❌ Có lỗi khi phát.');
-                    } catch (e) {
-                        console.error('❌ Lỗi gửi followUp trong player error:', e.message);
-                    }
+                    interaction.followUp('❌ Có lỗi khi phát.');
                     queue.songs.shift();
                     playSong(interaction, queue);
                 });
             }
 
+            // Tạo file TTS
             const ttsFilePath = await createTTSFile(text, guild.id);
             queue.songs.push({
                 url: ttsFilePath,
@@ -817,128 +701,105 @@ client.on('interactionCreate', async (interaction) => {
                 source: 'tts',
             });
 
+            // Phát TTS
             if (queue.songs.length === 1) {
                 console.log('🎙 Phát TTS:', text.slice(0, 50));
-                await interaction.editReply(`🎶 Đang đọc: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
+                await interaction.editReply(`🎙 Đang đọc: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
                 playSong(interaction, queue);
             } else {
                 console.log('🎙 Thêm TTS vào queue:', text.slice(0, 50));
-                await interaction.editReply(`🎶 Đã thêm vào hàng đợi: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
+                await interaction.editReply(`🎙 Đã thêm vào hàng đợi: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
             }
         } catch (err) {
-            console.error('❌ Lỗi khi xử lý TTS:', err.message, err.stack);
-            try {
-                await interaction.editReply(`❌ Không thể đọc văn bản: ${err.message || 'Lỗi không xác định.'}`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong TTS:', e.message);
-            }
+            console.error('❌ Lỗi khi xử lý TTS:', err.message);
+            await interaction.editReply(`❌ Không thể đọc văn bản: ${err.message || 'Lỗi không xác định.'}`);
         }
     } else if (commandName === 'skip') {
-        try {
-            await interaction.deferReply();
-            const guild = interaction.guild;
-            const queue = queues.get(guild.id);
-            if (!queue || !queue.songs.length) {
-                console.log('⚠️ Không có bài hát nào trong hàng đợi để bỏ qua.');
-                return interaction.editReply('❌ Không có bài hát nào trong hàng đợi.');
-            }
-
-            queue.player.stop();
-            console.log('⏹ Dừng player trước khi skip:', guild.id);
-
-            const currentSong = queue.songs[0];
-            if (currentSong && currentSong.source === 'tts' && currentSong.url) {
-                try { fs.unlinkSync(currentSong.url); } catch (e) {}
-                console.log('🗑 Đã xóa file TTS khi skip:', currentSong.url);
-            }
-
-            queue.songs.shift();
-            console.log('⏭ Skip bài hát, queue còn:', queue.songs.length);
-
-            await interaction.editReply('⏭ Đã bỏ qua bài hát.');
-            playSong(interaction, queue);
-        } catch (err) {
-            console.error('❌ Lỗi khi skip:', err.message, err.stack);
-            try {
-                await interaction.editReply(`❌ Lỗi khi bỏ qua bài hát: ${err.message || 'Lỗi không xác định.'}`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong skip:', e.message);
-            }
+        const guild = interaction.guild;
+        const queue = queues.get(guild.id);
+        if (!queue || !queue.songs.length) {
+            console.log('⚠️ Skip: Không có bài hát trong queue');
+            return interaction.reply('❌ Không có bài hát nào trong hàng đợi.');
         }
+
+        // Dừng player trước khi skip
+        queue.player.stop();
+        console.log('⏹ Dừng player trước khi skip:', guild.id);
+
+        // Xóa file TTS nếu có
+        const currentSong = queue.songs[0];
+        if (currentSong && currentSong.source === 'tts' && currentSong.url) {
+            try { fs.unlinkSync(currentSong.url); } catch (e) { }
+            console.log('🗑 Đã xóa file TTS khi skip:', currentSong.url);
+        }
+
+        // Bỏ bài hiện tại
+        queue.songs.shift();
+        console.log('⏭ Skip bài hát, queue còn:', queue.songs.length);
+
+        await interaction.reply('⏭ Đã bỏ qua bài hát.');
+        playSong(interaction, queue);
     } else if (commandName === 'pause') {
-        try {
-            await interaction.deferReply();
-            const guild = interaction.guild;
-            const queue = queues.get(guild.id);
-            if (!queue || !queue.songs.length) {
-                console.log('⚠️ Không có bài hát nào để tạm dừng.');
-                return interaction.editReply('❌ Không có bài hát nào đang phát.');
-            }
-            if (queue.player.state.status === AudioPlayerStatus.Playing) {
-                queue.player.pause();
-                console.log('⏸ Đã tạm dừng nhạc');
-                await interaction.editReply('⏸ Đã tạm dừng nhạc.');
-            } else {
-                console.log('⚠️ Nhạc không ở trạng thái đang phát.');
-                await interaction.editReply('❌ Nhạc đã được tạm dừng hoặc không phát.');
-            }
-        } catch (err) {
-            console.error('❌ Lỗi khi pause:', err.message, err.stack);
-            try {
-                await interaction.editReply(`❌ Lỗi khi tạm dừng: ${err.message || 'Lỗi không xác định.'}`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong pause:', e.message);
-            }
+        const guild = interaction.guild;
+        const queue = queues.get(guild.id);
+        if (!queue || !queue.songs.length) {
+            console.log('⚠️ Pause: Không có bài hát đang phát');
+            return interaction.reply('❌ Không có bài hát nào đang phát.');
+        }
+        if (queue.player.state.status === AudioPlayerStatus.Playing) {
+            queue.player.pause();
+            console.log('⏸ Đã tạm dừng nhạc');
+            await interaction.reply('⏸ Đã tạm dừng nhạc.');
+        } else {
+            console.log('⚠️ Pause: Nhạc không ở trạng thái playing');
+            await interaction.reply('❌ Nhạc đã được tạm dừng hoặc không phát.');
         }
     } else if (commandName === 'resume') {
-        try {
-            await interaction.deferReply();
-            const guild = interaction.guild;
-            const queue = queues.get(guild.id);
-            if (!queue || !queue.songs.length) {
-                console.log('⚠️ Không có bài hát nào để tiếp tục.');
-                return interaction.editReply('❌ Không có bài hát nào trong hàng đợi.');
-            }
-            if (queue.player.state.status === AudioPlayerStatus.Paused) {
-                queue.player.unpause();
-                console.log('▶️ Đã tiếp tục phát nhạc');
-                await interaction.editReply('▶️ Đã tiếp tục phát nhạc.');
-            } else {
-                console.log('⚠️ Nhạc không ở trạng thái tạm dừng.');
-                await interaction.editReply('❌ Nhạc không được tạm dừng để tiếp tục.');
-            }
-        } catch (err) {
-            console.error('❌ Lỗi khi resume:', err.message, err.stack);
-            try {
-                await interaction.editReply(`❌ Lỗi khi tiếp tục: ${err.message || 'Lỗi không xác định.'}`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong resume:', e.message);
-            }
+        const guild = interaction.guild;
+        const queue = queues.get(guild.id);
+        if (!queue || !queue.songs.length) {
+            console.log('⚠️ Resume: Không có bài hát trong queue');
+            return interaction.reply('❌ Không có bài hát nào trong hàng đợi.');
+        }
+        if (queue.player.state.status === AudioPlayerStatus.Paused) {
+            queue.player.unpause();
+            console.log('▶️ Đã tiếp tục phát nhạc');
+            await interaction.reply('▶️ Đã tiếp tục phát nhạc.');
+        } else {
+            console.log('⚠️ Resume: Nhạc không ở trạng thái paused');
+            await interaction.reply('❌ Nhạc không được tạm dừng để tiếp tục.');
         }
     } else if (commandName === 'queue') {
-        try {
-            await interaction.deferReply();
-            const guild = interaction.guild;
-            const queue = queues.get(guild.id);
-            if (!queue || !queue.songs.length) {
-                console.log('⚠️ Hàng đợi trống.');
-                return interaction.editReply('❌ Hàng đợi trống.');
-            }
-            const queueList = queue.songs.map((song, index) => `${index + 1}. **${song.title}** (${song.source})`).join('\n');
-            console.log('📜 Hiển thị queue:', queue.songs.length, 'bài');
-            await interaction.editReply(`📜 **Danh sách phát**:\n${queueList}`);
-        } catch (err) {
-            console.error('❌ Lỗi khi hiển thị queue:', err.message, err.stack);
-            try {
-                await interaction.editReply(`❌ Lỗi khi xem danh sách phát: ${err.message || 'Lỗi không xác định.'}`);
-            } catch (e) {
-                console.error('❌ Lỗi gửi editReply trong queue:', e.message);
-            }
+        const guild = interaction.guild;
+        const queue = queues.get(guild.id);
+        if (!queue || !queue.songs.length) {
+            console.log('⚠️ Queue: Hàng đợi rỗng');
+            return interaction.reply('❌ Hàng đợi trống.');
         }
-    });
+        const queueList = queue.songs.map((song, index) => `${index + 1}. **${song.title}** (${song.source})`).join('\n');
+        console.log('📜 Hiển thị queue:', queue.songs.length, 'bài');
+        await interaction.reply(`📜 **Danh sách phát**:\n${queueList}`);
+    } else if (commandName === 'destroy') {
+        const guild = interaction.guild;
+        const queue = queues.get(guild.id);
+        if (!queue) {
+            console.log('⚠️ Destroy: Không có queue để xóa');
+            return interaction.reply('❌ Không có hàng đợi để xóa.');
+        }
+
+        // Xóa toàn bộ queue và ngắt kết nối
+        clearQueue(guild.id);
+        if (queue.connection) {
+            queue.connection.destroy();
+            console.log('🗑 Đã ngắt kết nối voice:', guild.id);
+        }
+        queues.delete(guild.id);
+        await interaction.reply('🗑 Đã xóa toàn bộ hàng đợi và ngắt kết nối khỏi voice channel.');
+    }
+});
 
 client.login(process.env.DISCORD_TOKEN).catch((error) => {
-    console.error('❌ Lỗi đăng nhập bot:', error.message, error.stack);
+    console.error('❌ Lỗi đăng nhập bot:', error.message);
 });
 
 // Web server với HTTPS
@@ -946,23 +807,19 @@ const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Route kiểm tra bot hoạt động
-app.get('/', (req, res) => {
-    res.send('Bot is running!');
-});
+try {
+    const privateKey = fs.readFileSync('key.pem', 'utf8');
+    const certificate = fs.readFileSync('cert.pem', 'utf8');
+    const credentials = { key: privateKey, cert: certificate };
 
-// Khởi động HTTP server
-app.listen(PORT, () => {
-    console.log(`🌐 HTTP server đang chạy tại cổng ${PORT}`);
-});
-
-// Thêm đoạn này vào cuối file sau khi server đã start
-setInterval(() => {
-    const https = require('https');
-
-    https.get('https://botchatdiscord.onrender.com', (res) => {
-        console.log(`[Keep-Alive] Ping thành công với status: ${res.statusCode}`);
-    }).on('error', (e) => {
-        console.error('[Keep-Alive] Lỗi khi ping:', e.message);
+    app.get('/', (req, res) => {
+        res.send('Bot is running!');
     });
-}, 1000 * 60 * 4); // Mỗi 4 phút
+
+    const httpsServer = https.createServer(credentials, app);
+    httpsServer.listen(PORT, () => {
+        console.log(`✅ HTTPS server đang chạy tại cổng ${PORT}`);
+    });
+} catch (error) {
+    console.error('❌ Lỗi khởi tạo HTTPS server:', error.message, error.stack);
+}
