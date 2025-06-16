@@ -24,7 +24,7 @@ const ytdl = require('@distube/ytdl-core');
 const SpotifyWebApi = require('spotify-web-api-node');
 const stringSimilarity = require('string-similarity');
 const gTTS = require('gtts');
-const RateLimit = require('async-rate-limit');
+const pRateLimit = require('p-ratelimit');
 
 // Khởi tạo Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -34,17 +34,17 @@ const spotifyApi = new SpotifyWebApi({
 });
 
 // Khởi tạo rate limiter
-const youtubeApiRateLimit = new RateLimit({
-    max: 10, // 10 yêu cầu API YouTube mỗi giây
-    duration: 1000,
+const youtubeApiRateLimit = pRateLimit({
+    interval: 1000, // 1 giây
+    rate: 10,      // 10 yêu cầu mỗi giây
 });
-const spotifyRateLimit = new RateLimit({
-    max: 5, // 5 yêu cầu Spotify mỗi giây
-    duration: 1000,
+const spotifyRateLimit = pRateLimit({
+    interval: 1000,
+    rate: 5,       // 5 yêu cầu mỗi giây
 });
-const youtubeStreamRateLimit = new RateLimit({
-    max: 3, // 3 stream YouTube mỗi giây
-    duration: 1000,
+const youtubeStreamRateLimit = pRateLimit({
+    interval: 1000,
+    rate: 3,       // 3 stream mỗi giây
 });
 
 // Slash commands
@@ -126,11 +126,11 @@ client.once('ready', async () => {
     }
 });
 
-// Hàm xử lý Retry-After
+// Hàm xử lý Retry-After cho lỗi 429
 async function handleRateLimit(error, interaction, retryCallback, maxRetries = 3) {
-    if (error.response?.status === 429 || error.status === 429) {
+    if (error.response?.status === 429 || error.status === 429 || error.message.includes('429')) {
         const retryAfter = parseInt(error.response?.headers['retry-after'] || error.headers?.['retry-after'] || '5', 10) * 1000;
-        console.log(`⚠️ Lỗi 429: Chờ ${retryAfter}ms trước khi thử lại`);
+        console.log(`⚠️ Lỗi 429: Chờ ${retryAfter}ms trước khi thử lại, còn ${maxRetries} lần thử`);
         if (maxRetries <= 0) {
             await interaction.followUp(`❌ Quá nhiều yêu cầu, thử lại sau vài phút.`);
             throw new Error('Hết lượt thử lại sau lỗi 429');
@@ -176,7 +176,7 @@ function extractMediaId(url) {
 
 // Hàm tìm video YouTube
 async function findYouTubeVideo(title) {
-    return youtubeApiRateLimit.run(async () => {
+    return youtubeApiRateLimit(async () => {
         try {
             const ytSearchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(title + ' official audio')}&type=video&key=${process.env.YOUTUBE_API_KEY}&maxResults=5`;
             const ytResponse = await axios.get(ytSearchUrl);
@@ -196,14 +196,14 @@ async function findYouTubeVideo(title) {
             };
         } catch (error) {
             console.error('❌ Lỗi tìm kiếm YouTube:', error.message);
-            return null;
+            return await handleRateLimit(error, null, () => findYouTubeVideo(title));
         }
     });
 }
 
 // Hàm lấy danh sách video từ YouTube playlist
 async function fetchYouTubePlaylist(playlistId) {
-    return youtubeApiRateLimit.run(async () => {
+    return youtubeApiRateLimit(async () => {
         try {
             const ytPlaylistUrl = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=10&playlistId=${playlistId}&key=${process.env.YOUTUBE_API_KEY}`;
             const response = await axios.get(ytPlaylistUrl);
@@ -219,7 +219,7 @@ async function fetchYouTubePlaylist(playlistId) {
             }));
         } catch (error) {
             console.error('❌ Lỗi lấy playlist YouTube:', error.message);
-            return [];
+            return await handleRateLimit(error, null, () => fetchYouTubePlaylist(playlistId));
         }
     });
 }
@@ -287,7 +287,7 @@ async function playSong(interaction, queue, retries = 3) {
                 inputType: StreamType.Raw,
             });
         } else {
-            await youtubeStreamRateLimit.run(async () => {
+            await youtubeStreamRateLimit(async () => {
                 console.log(`🔍 Bắt đầu stream YouTube: ${song.url}`);
                 const stream = ytdl(song.url, {
                     filter: 'audioonly',
@@ -365,37 +365,7 @@ client.on('interactionCreate', async (interaction) => {
             }
         } catch (error) {
             console.error('❌ Lỗi AI:', error.message);
-            await handleRateLimit(error, interaction, async (retries) => {
-                const response = await axios.post(
-                    'https://openrouter.ai/api/v1/chat/completions',
-                    {
-                        model: 'qwen/qwen3-32b:free',
-                        messages: [{ role: 'user', content: prompt }],
-                    },
-                    {
-                        headers: {
-                            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-                            'Content-Type': 'application/json',
-                        },
-                    }
-                );
-                const reply = response.data.choices[0].message.content;
-                const file = await generateFileFromResponse(prompt, reply);
-                if (file) {
-                    await interaction.editReply({
-                        content: '📝 Đây là file bạn yêu cầu:',
-                        files: [file],
-                    });
-                } else {
-                    const chunks = reply.match(/[\s\S]{1,2000}/g);
-                    await interaction.editReply(chunks[0]);
-                    for (let i = 1; i < chunks.length; i++) {
-                        await interaction.followUp(chunks[i]);
-                    }
-                }
-            }).catch(() => {
-                interaction.editReply('❌ Có lỗi xảy ra khi gọi OpenRouter.');
-            });
+            await interaction.editReply('❌ Có lỗi xảy ra khi gọi OpenRouter.');
         }
     } else if (commandName === 'play') {
         const query = interaction.options.getString('query');
@@ -492,7 +462,7 @@ client.on('interactionCreate', async (interaction) => {
             if (mediaId) {
                 console.log('🔍 Xử lý media:', mediaId);
                 if (mediaId.type === 'spotify_track') {
-                    await spotifyRateLimit.run(async () => {
+                    await spotifyRateLimit(async () => {
                         try {
                             const trackResponse = await spotifyApi.getTrack(mediaId.id);
                             const track = trackResponse.body;
@@ -530,7 +500,7 @@ client.on('interactionCreate', async (interaction) => {
                         }
                     });
                 } else if (mediaId.type === 'spotify_playlist') {
-                    await spotifyRateLimit.run(async () => {
+                    await spotifyRateLimit(async () => {
                         try {
                             const playlistResponse = await spotifyApi.getPlaylist(mediaId.id);
                             const playlist = playlistResponse.body;
@@ -586,7 +556,7 @@ client.on('interactionCreate', async (interaction) => {
             } else {
                 console.log('🔍 Tìm kiếm query:', query);
                 const [spotifyResult, youtubeResult] = await Promise.allSettled([
-                    spotifyRateLimit.run(async () => {
+                    spotifyRateLimit(async () => {
                         const searchResults = await spotifyApi.searchTracks(query, { limit: 1 });
                         const tracks = searchResults.body.tracks.items;
                         if (!tracks || tracks.length === 0) {
@@ -604,7 +574,7 @@ client.on('interactionCreate', async (interaction) => {
                             url: ytVideo.url,
                         };
                     }),
-                    youtubeApiRateLimit.run(async () => {
+                    youtubeApiRateLimit(async () => {
                         if (ytdl.validateURL(query)) {
                             const videoDetails = await ytdl.getBasicInfo(query);
                             return {
@@ -668,7 +638,7 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.editReply(`🎶 Đã thêm ${addedCount} bài vào hàng đợi. Bài đầu tiên: **${queue.songs[0].title}** (Nguồn: ${queue.songs[0].source})`);
             }
         } catch (err) {
-            console.error('❌ Lỗi khi phát nhạc:', err.message, err.stack);
+            console.error('❌ Lỗi khi phát âm nhạc:', err.message, err.stack);
             await interaction.editReply(
                 `❌ Không thể phát nhạc: ${err.message || 'Lỗi không xác định.'}`
             );
@@ -688,7 +658,7 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply('❌ Bạn cần tham gia voice channel trước!');
         }
         if (
-            !voiceChannel.permissionsFor(guild.members.me).has([
+            !voiceChannel.permissionsForMember(guild.members.me).has([
                 PermissionsBitField.Flags.Connect,
                 PermissionsBitField.Flags.Speak,
             ])
@@ -777,11 +747,11 @@ client.on('interactionCreate', async (interaction) => {
 
             if (queue.songs.length === 1) {
                 console.log('🎙 Phát TTS:', text.slice(0, 50));
-                await interaction.editReply(`🎙 Đang đọc: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
+                await interaction.editReply(`🎶 Đang đọc: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
                 playSong(interaction, queue);
             } else {
                 console.log('🎙 Thêm TTS vào queue:', text.slice(0, 50));
-                await interaction.editReply(`🎙 Đã thêm vào hàng đợi: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
+                await interaction.editReply(`🎶 Đã thêm vào hàng đợi: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
             }
         } catch (err) {
             console.error('❌ Lỗi khi xử lý TTS:', err.message, err.stack);
@@ -791,7 +761,7 @@ client.on('interactionCreate', async (interaction) => {
         const guild = interaction.guild;
         const queue = queues.get(guild.id);
         if (!queue || !queue.songs.length) {
-            console.log('⚠️ Skip: Không có bài hát trong queue');
+            console.log('Không có bài hát nào trong hàng đợi để bỏ qua.');
             return interaction.reply('❌ Không có bài hát nào trong hàng đợi.');
         }
 
@@ -813,7 +783,7 @@ client.on('interactionCreate', async (interaction) => {
         const guild = interaction.guild;
         const queue = queues.get(guild.id);
         if (!queue || !queue.songs.length) {
-            console.log('⚠️ Pause: Không có bài hát đang phát');
+            console.log('⚠️ Không có bài hát nào để tạm dừng.');
             return interaction.reply('❌ Không có bài hát nào đang phát.');
         }
         if (queue.player.state.status === AudioPlayerStatus.Playing) {
@@ -821,14 +791,14 @@ client.on('interactionCreate', async (interaction) => {
             console.log('⏸ Đã tạm dừng nhạc');
             await interaction.reply('⏸ Đã tạm dừng nhạc.');
         } else {
-            console.log('⚠️ Pause: Nhạc không ở trạng thái playing');
+            console.log('⚠️ Nhạc không ở trạng thái đang phát.');
             await interaction.reply('❌ Nhạc đã được tạm dừng hoặc không phát.');
         }
     } else if (commandName === 'resume') {
         const guild = interaction.guild;
         const queue = queues.get(guild.id);
         if (!queue || !queue.songs.length) {
-            console.log('⚠️ Resume: Không có bài hát trong queue');
+            console.log('⚠️ Không có bài hát nào để tiếp tục.');
             return interaction.reply('❌ Không có bài hát nào trong hàng đợi.');
         }
         if (queue.player.state.status === AudioPlayerStatus.Paused) {
@@ -836,15 +806,15 @@ client.on('interactionCreate', async (interaction) => {
             console.log('▶️ Đã tiếp tục phát nhạc');
             await interaction.reply('▶️ Đã tiếp tục phát nhạc.');
         } else {
-            console.log('▶️ Resume: Nhạc không ở trạng thái paused');
+            console.log('⚠️ Nhạc không ở trạng thái tạm dừng.');
             await interaction.reply('❌ Nhạc không được tạm dừng để tiếp tục.');
         }
     } else if (commandName === 'queue') {
         const guild = interaction.guild;
         const queue = queues.get(guild.id);
         if (!queue || !queue.songs.length) {
-            console.log('⚠️ Queue: Hàng đợi rỗng');
-            return interaction.reply('❌ Hàng đợi trống.');
+            console.log('⚠️ Hàng đợi trống.');
+            return interaction.reply('❌ Hàng đợi rỗng.');
         }
         const queueList = queue.songs.map((song, index) => `${index + 1}. **${song.title}** (${song.source})`).join('\n');
         console.log('📜 Hiển thị queue:', queue.songs.length, 'bài');
