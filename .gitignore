@@ -50,3 +50,5 @@ pids/
 
 # Others
 *.swp
+
+*.pem
