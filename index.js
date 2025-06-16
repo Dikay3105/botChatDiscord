@@ -24,7 +24,7 @@ const ytdl = require('@distube/ytdl-core');
 const SpotifyWebApi = require('spotify-web-api-node');
 const stringSimilarity = require('string-similarity');
 const gTTS = require('gtts');
-const pRateLimit = require('p-ratelimit');
+const RateLimit = require('promise-ratelimit');
 
 // Khởi tạo Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -34,18 +34,9 @@ const spotifyApi = new SpotifyWebApi({
 });
 
 // Khởi tạo rate limiter
-const youtubeApiRateLimit = pRateLimit({
-    interval: 1000, // 1 giây
-    rate: 10,      // 10 yêu cầu mỗi giây
-});
-const spotifyRateLimit = pRateLimit({
-    interval: 1000,
-    rate: 5,       // 5 yêu cầu mỗi giây
-});
-const youtubeStreamRateLimit = pRateLimit({
-    interval: 1000,
-    rate: 3,       // 3 stream mỗi giây
-});
+const youtubeApiRateLimit = new RateLimit(100); // 10 req/s (100ms delay between requests)
+const spotifyRateLimit = new RateLimit(200); // 5 req/s (200ms delay)
+const youtubeStreamRateLimit = new RateLimit(333); // 3 req/s (333ms delay)
 
 // Slash commands
 const commands = [
@@ -658,7 +649,7 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply('❌ Bạn cần tham gia voice channel trước!');
         }
         if (
-            !voiceChannel.permissionsForMember(guild.members.me).has([
+            !voiceChannel.permissionsFor(guild.members.me).has([
                 PermissionsBitField.Flags.Connect,
                 PermissionsBitField.Flags.Speak,
             ])
@@ -825,6 +816,7 @@ client.on('interactionCreate', async (interaction) => {
 client.login(process.env.DISCORD_TOKEN).catch((error) => {
     console.error('❌ Lỗi đăng nhập bot:', error.message, error.stack);
 });
+
 
 // Web server với HTTPS
 const express = require('express');
