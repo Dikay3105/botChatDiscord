@@ -20,6 +20,6 @@
     "pdfkit": "^0.15.2",
     "spotify-web-api-node": "^5.0.2",
     "string-similarity": "^4.0.4",
-    "async-ratelimit": "^1.0.0"
+    "async-rate-limit": "^1.0.0"
   }
 }
