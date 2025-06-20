@@ -32,6 +32,32 @@ const spotifyApi = new SpotifyWebApi({
     redirectUri: process.env.SPOTIFY_REDIRECT_URI,
 });
 
+// Biến để lưu token và thời gian hết hạn
+let spotifyAccessToken = null;
+let spotifyTokenExpiresAt = 0;
+
+// Hàm làm mới token Spotify
+async function refreshSpotifyToken() {
+    try {
+        console.log('🔄 Làm mới token Spotify...');
+        const data = await spotifyApi.clientCredentialsGrant();
+        spotifyAccessToken = data.body['access_token'];
+        spotifyTokenExpiresAt = Date.now() + data.body['expires_in'] * 1000;
+        spotifyApi.setAccessToken(spotifyAccessToken);
+        console.log('✅ Token Spotify đã được làm mới, hết hạn lúc:', new Date(spotifyTokenExpiresAt));
+    } catch (error) {
+        console.error('❌ Lỗi khi làm mới token Spotify:', error.message);
+        throw error;
+    }
+}
+
+// Hàm kiểm tra và làm mới token nếu cần
+async function ensureSpotifyToken() {
+    if (!spotifyAccessToken || Date.now() >= spotifyTokenExpiresAt - 10000) {
+        await refreshSpotifyToken();
+    }
+}
+
 // Slash commands
 const commands = [
     new SlashCommandBuilder()
@@ -74,7 +100,7 @@ const commands = [
                 .setRequired(true)
         ),
     new SlashCommandBuilder()
-        .setName('destroy')
+        .setName(' usufruct')
         .setDescription('Xóa toàn bộ hàng đợi và ngắt kết nối bot khỏi voice channel'),
 ].map((cmd) => cmd.toJSON());
 
@@ -106,9 +132,7 @@ client.once('ready', async () => {
     console.log(`🤖 Bot đã sẵn sàng: ${client.user.tag}`);
     // Xác thực Spotify
     try {
-        const data = await spotifyApi.clientCredentialsGrant();
-        spotifyApi.setAccessToken(data.body['access_token']);
-        console.log('✅ Đã xác thực Spotify API');
+        await refreshSpotifyToken();
     } catch (error) {
         console.error('❌ Lỗi xác thực Spotify:', error.message);
     }
@@ -258,7 +282,6 @@ function clearQueue(guildId) {
 
 // Hàm phát bài hát hoặc TTS
 async function playSong(interaction, queue) {
-    // Hủy timeout rời kênh nếu có bài mới {
     if (queue.leaveTimeout) {
         console.log('🔄 Hủy timeout rời kênh vì có bài mới:', interaction.guild.id);
         clearTimeout(queue.leaveTimeout);
@@ -267,7 +290,7 @@ async function playSong(interaction, queue) {
 
     if (!queue.songs.length) {
         console.log('📭 Queue rỗng, lên lịch rời kênh:', interaction.guild.id);
-        queue.player.stop(); // Dừng player để tránh phát lại
+        queue.player.stop();
         scheduleLeave(interaction.guild.id, interaction);
         return;
     }
@@ -293,7 +316,7 @@ async function playSong(interaction, queue) {
 
         queue.player.play(resource);
         queue.connection.subscribe(queue.player);
-        console.log(`🎶 Đang phát: ${song.title} (Nguồn:Tesla: ${song.source})`);
+        console.log(`🎶 Đang phát: ${song.title} (Nguồn: ${song.source})`);
         await interaction.followUp(`🎶 Đang phát: **${song.title}** (Nguồn: ${song.source})`);
     } catch (error) {
         console.error('❌ Lỗi khi phát:', error.message);
@@ -332,7 +355,7 @@ client.on('interactionCreate', async (interaction) => {
             );
 
             const reply = response.data.choices[0].message.content;
-            const file = await generateFileFromResponse(prompt, reply)
+            const file = await generateFileFromResponse(prompt, reply);
 
             if (file) {
                 await interaction.editReply({
@@ -380,6 +403,8 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferReply();
 
         try {
+            await ensureSpotifyToken();
+
             // Khởi tạo queue nếu chưa có
             let queue = queues.get(guild.id);
             if (!queue) {
@@ -413,7 +438,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 queue.connection.on(VoiceConnectionStatus.Disconnected, async () => {
                     console.log('🔴 Bot bị ngắt kết nối khỏi voice channel:', guild.id);
-                    clearQueue(guild.id); // Xóa toàn bộ queue khi bị disconnect
+                    clearQueue(guild.id);
                     queue.connection?.destroy();
                     queue.connection = null;
                     queues.delete(guild.id);
@@ -449,7 +474,7 @@ client.on('interactionCreate', async (interaction) => {
             if (mediaId) {
                 console.log('🔍 Xử lý media:', mediaId);
                 if (mediaId.type === 'spotify_track') {
-                    // Xử lý track Spotify
+                    await ensureSpotifyToken();
                     const trackResponse = await spotifyApi.getTrack(mediaId.id);
                     const track = trackResponse.body;
                     if (!track) {
@@ -469,7 +494,7 @@ client.on('interactionCreate', async (interaction) => {
                     });
                     console.log('🎵 Spotify Track:', JSON.stringify(queue.songs[queue.songs.length - 1], null, 2));
                 } else if (mediaId.type === 'spotify_playlist') {
-                    // Xử lý playlist Spotify
+                    await ensureSpotifyToken();
                     const playlistResponse = await spotifyApi.getPlaylist(mediaId.id);
                     const playlist = playlistResponse.body;
                     if (!playlist || !playlist.tracks.items) {
@@ -490,7 +515,6 @@ client.on('interactionCreate', async (interaction) => {
                         }
                     }
                 } else if (mediaId.type === 'youtube_playlist') {
-                    // Xử lý playlist YouTube
                     const videos = await fetchYouTubePlaylist(mediaId.id);
                     if (videos.length === 0) {
                         console.log('⚠️ Không tìm thấy video trong playlist YouTube:', mediaId.id);
@@ -501,28 +525,50 @@ client.on('interactionCreate', async (interaction) => {
                 }
             } else {
                 console.log('🔍 Tìm kiếm query:', query);
-                // Tìm kiếm trên Spotify và YouTube
                 const [spotifyResult, youtubeResult] = await Promise.allSettled([
-                    // Spotify search
                     (async () => {
-                        const searchResults = await spotifyApi.searchTracks(query, { limit: 1 });
-                        const tracks = searchResults.body.tracks.items;
-                        if (!tracks || tracks.length === 0) {
-                            throw new Error('No Spotify results');
+                        try {
+                            await ensureSpotifyToken();
+                            const searchResults = await spotifyApi.searchTracks(query, { limit: 1 });
+                            const tracks = searchResults.body.tracks.items;
+                            if (!tracks || tracks.length === 0) {
+                                throw new Error('No Spotify results');
+                            }
+                            const track = tracks[0];
+                            const title = `${track.name} - ${track.artists[0].name}`;
+                            const ytVideo = await findYouTubeVideo(title);
+                            if (!ytVideo) {
+                                throw new Error('No YouTube match for Spotify track');
+                            }
+                            return {
+                                source: 'spotify',
+                                title: ytVideo.title,
+                                url: ytVideo.url,
+                            };
+                        } catch (error) {
+                            if (error.message.includes('access token expired')) {
+                                console.log('🔄 Thử làm mới token Spotify do lỗi hết hạn');
+                                await refreshSpotifyToken();
+                                const searchResults = await spotifyApi.searchTracks(query, { limit: 1 });
+                                const tracks = searchResults.body.tracks.items;
+                                if (!tracks || tracks.length === 0) {
+                                    throw new Error('No Spotify results');
+                                }
+                                const track = tracks[0];
+                                const title = `${track.name} - ${track.artists[0].name}`;
+                                const ytVideo = await findYouTubeVideo(title);
+                                if (!ytVideo) {
+                                    throw new Error('No YouTube match for Spotify track');
+                                }
+                                return {
+                                    source: 'spotify',
+                                    title: ytVideo.title,
+                                    url: ytVideo.url,
+                                };
+                            }
+                            throw error;
                         }
-                        const track = tracks[0];
-                        const title = `${track.name} - ${track.artists[0].name}`;
-                        const ytVideo = await findYouTubeVideo(title);
-                        if (!ytVideo) {
-                            throw new Error('No YouTube match for Spotify track');
-                        }
-                        return {
-                            source: 'spotify',
-                            title: ytVideo.title,
-                            url: ytVideo.url,
-                        };
                     })(),
-                    // YouTube search
                     (async () => {
                         if (ytdl.validateURL(query)) {
                             const videoDetails = await ytdl.getBasicInfo(query);
@@ -545,7 +591,6 @@ client.on('interactionCreate', async (interaction) => {
                     })(),
                 ]);
 
-                // Thu thập kết quả hợp lệ
                 const validResults = [];
                 if (spotifyResult.status === 'fulfilled') {
                     validResults.push(spotifyResult.value);
@@ -565,7 +610,6 @@ client.on('interactionCreate', async (interaction) => {
                     return interaction.editReply('❌ Không tìm thấy bài hát nào trên Spotify hoặc YouTube.');
                 }
 
-                // Chọn kết quả tốt nhất
                 const bestMatch = getBestMatch(query, validResults);
                 if (!bestMatch) {
                     console.log('⚠️ Không tìm thấy bài hát phù hợp');
@@ -579,7 +623,6 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
-            // Phát bài hát
             if (queue.songs.length === 1) {
                 console.log('🎵 Phát bài đầu tiên:', queue.songs[0].title);
                 await interaction.editReply(`🎶 Đã thêm: **${queue.songs[0].title}** (Nguồn: ${queue.songs[0].source})`);
@@ -601,7 +644,6 @@ client.on('interactionCreate', async (interaction) => {
         const voiceChannel = member?.voice?.channel;
         const guild = interaction.guild;
 
-        // Kiểm tra điều kiện cần thiết
         if (!guild) {
             console.log('⚠️ Lệnh tts trong non-guild context');
             return interaction.reply('❌ Lệnh này chỉ hoạt động trong server.');
@@ -629,7 +671,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.deferReply();
 
         try {
-            // Khởi tạo queue nếu chưa có
             let queue = queues.get(guild.id);
             if (!queue) {
                 console.log('🆕 Tạo queue mới cho guild:', guild.id);
@@ -643,7 +684,6 @@ client.on('interactionCreate', async (interaction) => {
                 queues.set(guild.id, queue);
             }
 
-            // Kết nối voice channel nếu cần
             if (
                 !queue.connection ||
                 queue.connection.state.status === VoiceConnectionStatus.Disconnected ||
@@ -662,7 +702,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 queue.connection.on(VoiceConnectionStatus.Disconnected, async () => {
                     console.log('🔴 Bot bị ngắt kết nối khỏi voice channel:', guild.id);
-                    clearQueue(guild.id); // Xóa toàn bộ queue khi bị disconnect
+                    clearQueue(guild.id);
                     queue.connection?.destroy();
                     queue.connection = null;
                     queues.delete(guild.id);
@@ -693,7 +733,6 @@ client.on('interactionCreate', async (interaction) => {
                 });
             }
 
-            // Tạo file TTS
             const ttsFilePath = await createTTSFile(text, guild.id);
             queue.songs.push({
                 url: ttsFilePath,
@@ -701,7 +740,6 @@ client.on('interactionCreate', async (interaction) => {
                 source: 'tts',
             });
 
-            // Phát TTS
             if (queue.songs.length === 1) {
                 console.log('🎙 Phát TTS:', text.slice(0, 50));
                 await interaction.editReply(`🎙 Đang đọc: **${text.slice(0, 50)}${text.length > 50 ? '...' : ''}**`);
@@ -722,18 +760,15 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply('❌ Không có bài hát nào trong hàng đợi.');
         }
 
-        // Dừng player trước khi skip
         queue.player.stop();
         console.log('⏹ Dừng player trước khi skip:', guild.id);
 
-        // Xóa file TTS nếu có
         const currentSong = queue.songs[0];
         if (currentSong && currentSong.source === 'tts' && currentSong.url) {
             try { fs.unlinkSync(currentSong.url); } catch (e) { }
             console.log('🗑 Đã xóa file TTS khi skip:', currentSong.url);
         }
 
-        // Bỏ bài hiện tại
         queue.songs.shift();
         console.log('⏭ Skip bài hát, queue còn:', queue.songs.length);
 
@@ -787,7 +822,6 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply('❌ Không có hàng đợi để xóa.');
         }
 
-        // Xóa toàn bộ queue và ngắt kết nối
         clearQueue(guild.id);
         if (queue.connection) {
             queue.connection.destroy();
@@ -802,7 +836,7 @@ client.login(process.env.DISCORD_TOKEN).catch((error) => {
     console.error('❌ Lỗi đăng nhập bot:', error.message);
 });
 
-// Web server với HTTPS
+// Web server với HTTP
 const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -816,14 +850,3 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     console.log(`🌐 HTTP server đang chạy tại cổng ${PORT}`);
 });
-
-// Thêm đoạn này vào cuối file sau khi server đã start
-setInterval(() => {
-    const https = require('https');
-
-    https.get('https://botchatdiscord.onrender.com', (res) => {
-        console.log(`[Keep-Alive] Ping thành công với status: ${res.statusCode}`);
-    }).on('error', (e) => {
-        console.error('[Keep-Alive] Lỗi khi ping:', e.message);
-    });
-}, 1000 * 60 * 4); // Mỗi 4 phút
